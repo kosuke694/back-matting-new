@@ -1,0 +1,130 @@
+import os
+import cv2
+import torch
+import torchvision
+from PIL import Image
+from torchvision import transforms
+from functions import extract_foreground_with_mask  # Background-Matting用の関数
+from networks import ResnetConditionHR
+import numpy as np
+
+# Mask R-CNNモデルのロード（COCOデータセットで事前学習済み）
+maskrcnn_model = torchvision.models.detection.maskrcnn_resnet50_fpn(pretrained=True)
+maskrcnn_model.eval()
+
+# 楽器マスクを取得する関数
+def get_instrument_mask(bgr_img):
+    # 画像をPIL形式に変換してMask R-CNNで処理
+    image = Image.fromarray(cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB))
+    transform = transforms.Compose([transforms.ToTensor()])
+    image_tensor = transform(image).unsqueeze(0)
+
+    # Mask R-CNNによる予測
+    with torch.no_grad():
+        predictions = maskrcnn_model(image_tensor)
+    
+    # マスクとラベルを取得
+    labels = predictions[0]['labels'].numpy()
+    masks = predictions[0]['masks'].numpy()
+
+    # ギターとバイオリンのマスクを抽出
+    guitar_indices = [i for i, label in enumerate(labels) if label == 43]  # ギター
+    violin_indices = [i for i, label in enumerate(labels) if label == 44]  # バイオリン
+
+    instrument_mask = None
+    if guitar_indices:
+        instrument_mask = masks[guitar_indices[0]][0]  # ギターのマスク
+    if violin_indices:
+        violin_mask = masks[violin_indices[0]][0]  # バイオリンのマスク
+        instrument_mask = violin_mask if instrument_mask is None else instrument_mask | violin_mask
+
+    return instrument_mask
+
+# 入力が動画か画像かを判別する関数
+def is_video_file(filename):
+    video_extensions = ['.mp4', '.avi', '.mov', '.mkv']
+    return any(filename.endswith(ext) for ext in video_extensions)
+
+# メインの処理
+input_path = "sample_data/input/"
+output_video_path = 'output_with_instruments.mp4'
+
+# Background-Mattingモデルの初期化
+model_main_dir = 'Models/real-fixed-cam/'
+netM = ResnetConditionHR(input_nc=(3, 3, 1, 4), output_nc=4, n_blocks1=7, n_blocks2=3)
+netM = torch.nn.DataParallel(netM)
+netM.load_state_dict(torch.load(model_main_dir + 'netG_epoch_50.pth'))
+netM.cuda()
+netM.eval()
+
+# 入力フォルダ内のファイルを処理
+for filename in os.listdir(input_path):
+    file_path = os.path.join(input_path, filename)
+    
+    if is_video_file(filename):  # 動画ファイルの場合
+        cap = cv2.VideoCapture(file_path)
+
+        # 出力動画の設定
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_video_path, fourcc, 20.0, (int(cap.get(3)), int(cap.get(4))))
+
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # Background-Mattingを使用して人物のマスクを取得
+            person_mask = extract_foreground_with_mask(frame)  # Background-Mattingの既存関数
+
+            # Mask R-CNNで楽器のマスクを取得
+            instrument_mask = get_instrument_mask(frame)
+
+            # 楽器と人物のマスクを結合
+            if instrument_mask is not None:
+                instrument_mask_resized = cv2.resize(instrument_mask, (person_mask.shape[1], person_mask.shape[0]))
+                combined_mask = np.maximum(person_mask, instrument_mask_resized)
+            else:
+                combined_mask = person_mask
+
+            # 結合したマスクを使用して前景を抽出
+            alpha_pred, fg_pred_tmp = netM(torch.from_numpy(frame).unsqueeze(0).cuda(),
+                                           torch.from_numpy(frame).unsqueeze(0).cuda(),
+                                           torch.from_numpy(combined_mask).unsqueeze(0).cuda(),
+                                           torch.from_numpy(frame).unsqueeze(0).cuda())
+            
+            al_mask = (alpha_pred > 0.95).type(torch.cuda.FloatTensor)
+            fg_pred = frame * al_mask + fg_pred_tmp * (1 - al_mask)
+            out.write(fg_pred)
+
+        cap.release()
+        out.release()
+
+    else:  # 画像ファイルの場合
+        frame = cv2.imread(file_path)
+
+        # Background-Mattingを使用して人物のマスクを取得
+        person_mask = extract_foreground_with_mask(frame)
+
+        # Mask R-CNNで楽器のマスクを取得
+        instrument_mask = get_instrument_mask(frame)
+
+        # 楽器と人物のマスクを結合
+        if instrument_mask is not None:
+            instrument_mask_resized = cv2.resize(instrument_mask, (person_mask.shape[1], person_mask.shape[0]))
+            combined_mask = np.maximum(person_mask, instrument_mask_resized)
+        else:
+            combined_mask = person_mask
+
+        # 結合したマスクを使用して前景を抽出
+        alpha_pred, fg_pred_tmp = netM(torch.from_numpy(frame).unsqueeze(0).cuda(),
+                                       torch.from_numpy(frame).unsqueeze(0).cuda(),
+                                       torch.from_numpy(combined_mask).unsqueeze(0).cuda(),
+                                       torch.from_numpy(frame).unsqueeze(0).cuda())
+        
+        al_mask = (alpha_pred > 0.95).type(torch.cuda.FloatTensor)
+        fg_pred = frame * al_mask + fg_pred_tmp * (1 - al_mask)
+
+        # 前景抽出画像を保存
+        output_image_path = f'sample_data/output/{filename}_with_instruments.png'
+        cv2.imwrite(output_image_path, fg_pred)
+
