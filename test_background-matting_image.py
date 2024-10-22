@@ -32,7 +32,7 @@ parser.add_argument('-b', '--back', type=str,default=None,help='Captured backgro
 args=parser.parse_args()
 
 #input model
-model_main_dir='Models/' + args.trained_model + '/';
+model_main_dir='pre-trained_Models/' + args.trained_model + '/';
 #input data path
 data_path=args.input_dir
 

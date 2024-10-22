@@ -50,7 +50,7 @@ input_path = "sample_data/input/"
 output_video_path = 'output_with_instruments.mp4'
 
 # Background-Mattingモデルの初期化
-model_main_dir = 'Models/real-fixed-cam/'
+model_main_dir = 'pre-trained_Models/real-fixed-cam/'
 netM = ResnetConditionHR(input_nc=(3, 3, 1, 4), output_nc=4, n_blocks1=7, n_blocks2=3)
 netM = torch.nn.DataParallel(netM)
 netM.load_state_dict(torch.load(model_main_dir + 'netG_epoch_50.pth'))

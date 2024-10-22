@@ -39,7 +39,7 @@ args=parser.parse_args()
 
 ##Directories
 tb_dir='TB_Summary/' + args.name
-model_dir='Models/' + args.name
+model_dir='pre-trained_Models/' + args.name
 
 
 if not os.path.exists(model_dir):

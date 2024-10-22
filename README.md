@@ -110,7 +110,7 @@ Use `sample_data/` folder for testing and prepare your own data based on that. T
 
 ### Pre-trained model
 
-Please download the pre-trained models from [Google Drive](https://drive.google.com/drive/folders/1WLDBC_Q-cA72QC8bB-Rdj53UB2vSPnXv?usp=sharing) and place `Models/` folder inside `Background-Matting/`.
+Please download the pre-trained models from [Google Drive](https://drive.google.com/drive/folders/1WLDBC_Q-cA72QC8bB-Rdj53UB2vSPnXv?usp=sharing) and place `pre-trained_Models/` folder inside `Background-Matting/`.
 
 Note: `syn-comp-adobe-trainset` model was trained on the training set of the Adobe dataset. This was the model used for numerical evaluation on Adobe dataset.
 
@@ -284,7 +284,7 @@ The process is automated by `prepare_real.py` -- take a look inside and change `
 Change number of GPU and required batch-size, depending on your platform. We trained the model with 512x512 input (`-res` flag).
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 python train_real_fixed.py -n Real_fixed -bs 4 -res 512 -init_model Models/syn-comp-adobe-trainset/net_epoch_64.pth
+CUDA_VISIBLE_DEVICES=0,1 python train_real_fixed.py -n Real_fixed -bs 4 -res 512 -init_model pre-trained_Models/syn-comp-adobe-trainset/net_epoch_64.pth
 ```
 
 
