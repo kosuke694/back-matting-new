@@ -1,57 +1,107 @@
-import os
-import yaml
 import torch
-import torch.optim as optim
+from torch import nn, optim
 from torch.utils.data import DataLoader
-from model import YourModel
-from dataset import InstrumentDataset
-from utils import save_checkpoint, load_checkpoint, Logger
+from model import MyModel  # ユーザーが定義した MyModel をインポート
+from dataset import CustomDataset  # ユーザーが定義したデータセット
+import os
 
-def train(model, dataloader, optimizer, criterion, epoch, device, log_interval=10):
-    model.train()
-    running_loss = 0.0
-    for batch_idx, (inputs, targets) in enumerate(dataloader):
-        inputs, targets = inputs.to(device), targets.to(device)
-        
-        optimizer.zero_grad()
-        outputs = model(inputs)
-        loss = criterion(outputs, targets)
-        loss.backward()
-        optimizer.step()
-        
-        running_loss += loss.item()
-        
-        if batch_idx % log_interval == 0:
-            print(f'Epoch [{epoch}], Batch [{batch_idx}/{len(dataloader)}], Loss: {loss.item()}')
-    return running_loss / len(dataloader)
+def load_pretrained_model(model, pretrained_model_path, device):
+    """
+    事前学習済みモデルの状態辞書をロードし、"module." プレフィックスの有無を自動的に調整し、
+    必要に応じてキー名を変換してモデルにロードします。
+    """
+    print(f"事前学習済みモデルをロード中: {pretrained_model_path}")
 
-def main(config):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    os.makedirs(config['log_dir'], exist_ok=True)
-    os.makedirs(config['model_save_dir'], exist_ok=True)
-    logger = Logger(config['log_dir'])
+    # 事前学習済みモデルの状態辞書をロード
+    state_dict = torch.load(pretrained_model_path, map_location=device)
 
-    train_dataset = InstrumentDataset(config['train_data_dir'], config['train_mask_dir'])
-    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True)
+    # 現在のモデルのキーを取得
+    model_keys = set(model.state_dict().keys())
 
-    model = YourModel().to(device)
-    criterion = torch.nn.BCELoss()
-    optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
+    # 新しい状態辞書を作成
+    new_state_dict = {}
 
-    start_epoch = 0
-    if config.get('resume_checkpoint'):
-        start_epoch = load_checkpoint(config['resume_checkpoint'], model, optimizer)
+    for key, value in state_dict.items():
+        # プレフィックス "module." の追加/削除を自動調整
+        if key.startswith('module.') and not any(k.startswith('module.') for k in model_keys):
+            new_key = key.replace('module.', '')
+        elif not key.startswith('module.') and any(k.startswith('module.') for k in model_keys):
+            new_key = 'module.' + key
+        else:
+            new_key = key
 
-    for epoch in range(start_epoch, config['epochs']):
-        loss = train(model, train_loader, optimizer, criterion, epoch, device)
-        logger.log(epoch, loss)
-        if epoch % config['checkpoint_interval'] == 0:
-            save_checkpoint(model, optimizer, epoch, config['model_save_dir'])
+        # サイズの不一致がある層をスキップ
+        if new_key in model.state_dict() and model.state_dict()[new_key].shape == value.shape:
+            new_state_dict[new_key] = value
+        else:
+            print(f"Skipping loading parameter: {new_key} due to size mismatch.")
 
-    print("Training complete!")
+    # 新しい状態辞書をモデルにロード
+    model.load_state_dict(new_state_dict, strict=False)
+    print("事前学習済みモデルのロードが完了しました。")
+
+def train(model, dataloader, criterion, optimizer, device, num_epochs=10):
+    """
+    モデルをトレーニングするための関数
+    Args:
+        model (nn.Module): トレーニングするモデル
+        dataloader (DataLoader): トレーニングデータのデータローダ
+        criterion (nn.Module): 損失関数
+        optimizer (torch.optim.Optimizer): オプティマイザ
+        device (torch.device): 使用するデバイス（GPU/CPU）
+        num_epochs (int): エポック数
+    """
+    model.train()  # モデルをトレーニングモードに設定
+
+    for epoch in range(num_epochs):
+        running_loss = 0.0
+        for images, labels in dataloader:
+            images = images.to(device)
+            labels = labels.to(device)
+
+            optimizer.zero_grad()
+
+            # 順伝播
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+
+            # 逆伝播とオプティマイザステップ
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item()
+
+        print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {running_loss/len(dataloader):.4f}")
 
 if __name__ == "__main__":
-    config_path = "configs/train_config.yaml"
-    with open(config_path, "r") as f:
-        config = yaml.safe_load(f)
-    main(config)
+    # 設定ファイルや引数から情報を取得する部分（例）
+    config = {
+        "pretrained_model_path": "pre-trained_Models/real-fixed-cam/netG_epoch_12.pth",
+        "device": "cuda" if torch.cuda.is_available() else "cpu",
+        "batch_size": 16,
+        "learning_rate": 0.001,
+        "num_epochs": 10,
+        "data_dir": "path/to/your/dataset"  # データセットのディレクトリパスを指定
+    }
+
+    device = torch.device(config["device"])
+
+    # モデルのインスタンスを作成（ユーザーが定義する MyModel クラス）
+    model = MyModel().to(device)
+
+    # 事前学習済みモデルのロード
+    load_pretrained_model(model, config["pretrained_model_path"], device)
+
+    # データセットの準備（CustomDataset）
+    train_dataset = CustomDataset(data_dir=config["data_dir"], transform=None)
+    train_loader = DataLoader(train_dataset, batch_size=config["batch_size"], shuffle=True)
+
+    # 損失関数とオプティマイザの定義
+    criterion = nn.CrossEntropyLoss()  # 適切な損失関数に変更する必要あり
+    optimizer = optim.Adam(model.parameters(), lr=config["learning_rate"])
+
+    # モデルのトレーニング
+    print("モデルのトレーニングを開始します...")
+    train(model, train_loader, criterion, optimizer, device, num_epochs=config["num_epochs"])
+
+    print("モデルのトレーニングが完了しました。")

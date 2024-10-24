@@ -1,31 +1,47 @@
 import os
-import cv2
+from PIL import Image
 import torch
 from torch.utils.data import Dataset
 
-class InstrumentDataset(Dataset):
-    def __init__(self, image_dir, mask_dir, transform=None):
-        self.image_dir = image_dir
-        self.mask_dir = mask_dir
-        self.images = os.listdir(image_dir)
+class CustomDataset(Dataset):
+    def __init__(self, data_dir, transform=None):
+        """
+        カスタムデータセットの初期化
+        Args:
+            data_dir (str): 画像ファイルとラベルのあるディレクトリ
+            transform (callable, optional): 画像に適用する変換
+        """
+        self.data_dir = data_dir
         self.transform = transform
+        self.image_paths = []
+        self.labels = []
+
+        # ディレクトリ内の画像ファイルを読み込む
+        for label_dir in os.listdir(data_dir):
+            label_path = os.path.join(data_dir, label_dir)
+            if os.path.isdir(label_path):
+                for img_name in os.listdir(label_path):
+                    img_path = os.path.join(label_path, img_name)
+                    self.image_paths.append(img_path)
+                    self.labels.append(label_dir)  # ラベルはディレクトリ名から推測
 
     def __len__(self):
-        return len(self.images)
+        # データセットのサイズを返す
+        return len(self.image_paths)
 
     def __getitem__(self, idx):
-        img_path = os.path.join(self.image_dir, self.images[idx])
-        mask_path = os.path.join(self.mask_dir, self.images[idx].replace('_img', '_mask'))
+        # インデックスに対応する画像とラベルを取得
+        img_path = self.image_paths[idx]
+        label = self.labels[idx]
 
-        image = cv2.imread(img_path)
-        mask = cv2.imread(mask_path, 0)
+        # 画像を読み込む
+        image = Image.open(img_path).convert("RGB")
 
+        # 必要に応じて変換を適用
         if self.transform:
-            augmented = self.transform(image=image, mask=mask)
-            image = augmented['image']
-            mask = augmented['mask']
+            image = self.transform(image)
 
-        image = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
-        mask = torch.from_numpy(mask).unsqueeze(0).float() / 255.0
+        # ラベルをテンソルに変換（例: intにキャストしてからテンソル化）
+        label = torch.tensor(int(label))
 
-        return image, mask
+        return image, label
