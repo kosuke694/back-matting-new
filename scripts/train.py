@@ -1,107 +1,112 @@
-import torch
-from torch import nn, optim
-from torch.utils.data import DataLoader
-from model import MyModel  # ユーザーが定義した MyModel をインポート
-from dataset import CustomDataset  # ユーザーが定義したデータセット
 import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from dataset import CustomDataset
+from model import MyModel  # あなたのモデルに合わせて変更
+from datetime import datetime
+import matplotlib.pyplot as plt
 
-def load_pretrained_model(model, pretrained_model_path, device):
-    """
-    事前学習済みモデルの状態辞書をロードし、"module." プレフィックスの有無を自動的に調整し、
-    必要に応じてキー名を変換してモデルにロードします。
-    """
-    print(f"事前学習済みモデルをロード中: {pretrained_model_path}")
+# 設定
+config = {
+    "data_dir": "data/input",  # 入力画像ディレクトリ
+    "mask_dir": "data/masks",  # マスク画像ディレクトリ
+    "batch_size": 4,
+    "num_epochs": 10,
+    "learning_rate": 0.001,
+    "pretrained_model_path": "pre-trained_Models/real-fixed-cam/netG_epoch_12.pth",
+    "save_dir": "fine_tuned/InstrumentModel",  # モデルの保存ディレクトリ
+}
 
-    # 事前学習済みモデルの状態辞書をロード
-    state_dict = torch.load(pretrained_model_path, map_location=device)
+# デバイスの設定
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # 現在のモデルのキーを取得
-    model_keys = set(model.state_dict().keys())
-
-    # 新しい状態辞書を作成
-    new_state_dict = {}
-
-    for key, value in state_dict.items():
-        # プレフィックス "module." の追加/削除を自動調整
-        if key.startswith('module.') and not any(k.startswith('module.') for k in model_keys):
-            new_key = key.replace('module.', '')
-        elif not key.startswith('module.') and any(k.startswith('module.') for k in model_keys):
-            new_key = 'module.' + key
-        else:
-            new_key = key
-
-        # サイズの不一致がある層をスキップ
-        if new_key in model.state_dict() and model.state_dict()[new_key].shape == value.shape:
-            new_state_dict[new_key] = value
-        else:
-            print(f"Skipping loading parameter: {new_key} due to size mismatch.")
-
-    # 新しい状態辞書をモデルにロード
-    model.load_state_dict(new_state_dict, strict=False)
+# モデルの定義とロード
+model = MyModel().to(device)
+if os.path.exists(config["pretrained_model_path"]):
+    print(f"事前学習済みモデルをロード中: {config['pretrained_model_path']}")
+    state_dict = torch.load(config["pretrained_model_path"], map_location=device)
+    model.load_state_dict(state_dict, strict=False)
     print("事前学習済みモデルのロードが完了しました。")
+else:
+    print("事前学習済みモデルが見つかりませんでした。新しいモデルでトレーニングを開始します。")
 
-def train(model, dataloader, criterion, optimizer, device, num_epochs=10):
-    """
-    モデルをトレーニングするための関数
-    Args:
-        model (nn.Module): トレーニングするモデル
-        dataloader (DataLoader): トレーニングデータのデータローダ
-        criterion (nn.Module): 損失関数
-        optimizer (torch.optim.Optimizer): オプティマイザ
-        device (torch.device): 使用するデバイス（GPU/CPU）
-        num_epochs (int): エポック数
-    """
-    model.train()  # モデルをトレーニングモードに設定
+# データセットとデータローダーの準備
+transform = None  # 必要に応じてトランスフォームを追加
+train_dataset = CustomDataset(data_dir=config["data_dir"], mask_dir=config["mask_dir"], transform=transform)
+train_loader = DataLoader(train_dataset, batch_size=config["batch_size"], shuffle=True)
 
-    for epoch in range(num_epochs):
-        running_loss = 0.0
-        for images, labels in dataloader:
-            images = images.to(device)
-            labels = labels.to(device)
+# 損失関数と最適化手法
+criterion = nn.MSELoss()
+optimizer = optim.Adam(model.parameters(), lr=config["learning_rate"])
 
-            optimizer.zero_grad()
+# トレーニングループ
+losses = []
+for epoch in range(config["num_epochs"]):
+    model.train()
+    running_loss = 0.0
+    for i, (images, masks) in enumerate(train_loader):
+        images = images.to(device)
+        masks = masks.to(device)
+        
+        # 順伝播
+        outputs = model(images)
+        loss = criterion(outputs, masks)
 
-            # 順伝播
-            outputs = model(images)
-            loss = criterion(outputs, labels)
+        # 逆伝播と最適化
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
-            # 逆伝播とオプティマイザステップ
-            loss.backward()
-            optimizer.step()
+        running_loss += loss.item()
 
-            running_loss += loss.item()
+    # 平均損失の計算
+    avg_loss = running_loss / len(train_loader)
+    losses.append(avg_loss)
+    print(f"エポック {epoch + 1} が完了しました。平均損失: {avg_loss}")
 
-        print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {running_loss/len(dataloader):.4f}")
+# モデルの保存
+if not os.path.exists(config["save_dir"]):
+    os.makedirs(config["save_dir"])
 
-if __name__ == "__main__":
-    # 設定ファイルや引数から情報を取得する部分（例）
-    config = {
-        "pretrained_model_path": "pre-trained_Models/real-fixed-cam/netG_epoch_12.pth",
-        "device": "cuda" if torch.cuda.is_available() else "cpu",
-        "batch_size": 16,
-        "learning_rate": 0.001,
-        "num_epochs": 10,
-        "data_dir": "path/to/your/dataset"  # データセットのディレクトリパスを指定
-    }
+timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+model_save_path = os.path.join(config["save_dir"], f"fine_tuned_model_{timestamp}.pth")
+torch.save(model.state_dict(), model_save_path)
+print(f"トレーニング済みモデルが保存されました: {model_save_path}")
 
-    device = torch.device(config["device"])
+# 損失関数の可視化
+plt.figure()
+plt.plot(range(1, config["num_epochs"] + 1), losses, marker='o')
+plt.title("Training Loss")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+loss_plot_path = os.path.join(config["save_dir"], f"training_loss_{timestamp}.png")
+plt.savefig(loss_plot_path)
+plt.close()
+print(f"損失関数のグラフが保存されました: {loss_plot_path}")
 
-    # モデルのインスタンスを作成（ユーザーが定義する MyModel クラス）
-    model = MyModel().to(device)
+# 予測結果の可視化
+model.eval()
+sample_images, sample_masks = next(iter(train_loader))
+sample_images = sample_images.to(device)
+sample_masks = sample_masks.to(device)
+with torch.no_grad():
+    outputs = model(sample_images)
 
-    # 事前学習済みモデルのロード
-    load_pretrained_model(model, config["pretrained_model_path"], device)
+# 結果をプロット
+fig, axes = plt.subplots(3, config["batch_size"], figsize=(12, 6))
+for i in range(config["batch_size"]):
+    axes[0, i].imshow(sample_images[i].cpu().permute(1, 2, 0))  # 入力画像
+    axes[1, i].imshow(sample_masks[i].cpu().squeeze(), cmap='gray')  # 実際のマスク
+    # 予測されたマスクを表示
+    axes[2, i].imshow(outputs[i].cpu().squeeze()[0], cmap='gray')  # 予測されたマスクの1チャンネルを表示
 
-    # データセットの準備（CustomDataset）
-    train_dataset = CustomDataset(data_dir=config["data_dir"], transform=None)
-    train_loader = DataLoader(train_dataset, batch_size=config["batch_size"], shuffle=True)
 
-    # 損失関数とオプティマイザの定義
-    criterion = nn.CrossEntropyLoss()  # 適切な損失関数に変更する必要あり
-    optimizer = optim.Adam(model.parameters(), lr=config["learning_rate"])
+for ax in axes.flat:
+    ax.axis('off')
 
-    # モデルのトレーニング
-    print("モデルのトレーニングを開始します...")
-    train(model, train_loader, criterion, optimizer, device, num_epochs=config["num_epochs"])
-
-    print("モデルのトレーニングが完了しました。")
+output_plot_path = os.path.join(config["save_dir"], f"output_comparison_{timestamp}.png")
+plt.savefig(output_plot_path)
+plt.close()
+print(f"予測結果の比較グラフが保存されました: {output_plot_path}")
