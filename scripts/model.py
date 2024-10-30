@@ -1,44 +1,43 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-class MyModel(nn.Module):
-    def __init__(self):
+class MyModel(nn.Module):  # ResnetConditionHR に基づく更新
+    def __init__(self, input_nc, output_nc, ngf=64, norm_layer=nn.BatchNorm2d, use_dropout=False, 
+                 n_blocks1=7, n_blocks2=3, padding_type='reflect'):
         super(MyModel, self).__init__()
 
-        # エンコーダ部分（事前学習モデルに合わせた形状に修正）
+        # Encoder の設定
+        use_bias = True
+
+        # エンコーダ部分
         self.encoder1 = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=7, stride=1, padding=3),  # 事前学習モデルの形状: (64, 3, 7, 7)
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),  # 追加
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True)
+            nn.ReflectionPad2d(3),
+            nn.Conv2d(input_nc, ngf, kernel_size=7, padding=0, bias=use_bias),
+            norm_layer(ngf),
+            nn.ReLU(True),
+            nn.Conv2d(ngf, ngf * 2, kernel_size=3, stride=2, padding=1, bias=use_bias),
+            norm_layer(ngf * 2),
+            nn.ReLU(True)
         )
 
         self.encoder2 = nn.Sequential(
-            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),  # 事前学習モデルの形状: (256, 128, 3, 3)
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True)
+            nn.Conv2d(ngf * 2, ngf * 4, kernel_size=3, stride=2, padding=1, bias=use_bias),
+            norm_layer(ngf * 4),
+            nn.ReLU(True)
         )
 
-        # デコーダ部分（事前学習モデルに合わせた形状に修正）
+        # デコーダ部分
         self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(256, 128, kernel_size=3, stride=1, padding=1),  # 形状を 256 -> 128 に変更
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(128, 64, kernel_size=3, stride=1, padding=1),   # 形状を 128 -> 64 に変更
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(64, 3, kernel_size=7, stride=1, padding=3)  # 最終層の形状を調整
+            nn.ConvTranspose2d(ngf * 4, ngf * 2, kernel_size=3, stride=2, padding=1, output_padding=1, bias=use_bias),
+            norm_layer(ngf * 2),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(ngf * 2, output_nc, kernel_size=7, padding=3, bias=use_bias),
+            nn.Sigmoid()  # 最終出力に Sigmoid を仮定
         )
 
     def forward(self, x):
-        # エンコーダの実行
         x = self.encoder1(x)
         x = self.encoder2(x)
-
-        # デコーダの実行
+        # 必要に応じて追加の Residual ブロックを経由
         x = self.decoder(x)
-
         return x
