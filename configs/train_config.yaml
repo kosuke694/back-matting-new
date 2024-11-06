@@ -1,11 +1,17 @@
-epochs: 50
-batch_size: 8
-learning_rate: 0.0001
-checkpoint_interval: 5
+dataset_type: "train"
 
-train_data_dir: "data/input/"
-train_mask_dir: "data/masks/"
-model_save_dir: "models/fine_tuned/InstrumentModel/"
-log_dir: "training/logs/"
+annotation_files:
+  - "data/train/annotations_human.csv"
+  - "data/train/annotations_cello.csv"
+  - "data/train/annotations_piano.csv"
+  - "data/train/annotations_guitar.csv"
+  - "data/train/annotations_saxophone.csv"
 
-resume_checkpoint: null
+data_dir: "data"
+batch_size: 1
+num_epochs: 10
+learning_rate: 0.001
+
+pretrained_model_path: "pre-trained_Models/real-fixed-cam/netG_epoch_12.pth"
+save_dir: "models/"
+

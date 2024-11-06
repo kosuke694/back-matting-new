@@ -1,112 +1,156 @@
 import os
+import yaml
+import time
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
-from dataset import CustomDataset
-from model import MyModel  # あなたのモデルに合わせて変更
+from torch.utils.data import DataLoader, Subset
+import numpy as np
+from dataset import CustomDetectionDataset
+from model import MyDetectionModel
 from datetime import datetime
-import matplotlib.pyplot as plt
+from tqdm import tqdm
 
-# 設定
-config = {
-    "data_dir": "data/input",  # 入力画像ディレクトリ
-    "mask_dir": "data/masks",  # マスク画像ディレクトリ
-    "batch_size": 4,
-    "num_epochs": 10,
-    "learning_rate": 0.001,
-    "pretrained_model_path": "pre-trained_Models/real-fixed-cam/netG_epoch_12.pth",
-    "save_dir": "fine_tuned/InstrumentModel",  # モデルの保存ディレクトリ
-}
+# 設定ファイルの読み込み
+with open("C:/Users/klab/Desktop/back-matting-new/configs/train_config.yaml", "r") as file:
+    config = yaml.safe_load(file)
 
 # デバイスの設定
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# モデルの定義とロード
-model = MyModel().to(device)
-if os.path.exists(config["pretrained_model_path"]):
-    print(f"事前学習済みモデルをロード中: {config['pretrained_model_path']}")
-    state_dict = torch.load(config["pretrained_model_path"], map_location=device)
-    model.load_state_dict(state_dict, strict=False)
-    print("事前学習済みモデルのロードが完了しました。")
-else:
-    print("事前学習済みモデルが見つかりませんでした。新しいモデルでトレーニングを開始します。")
-
-# データセットとデータローダーの準備
-transform = None  # 必要に応じてトランスフォームを追加
-train_dataset = CustomDataset(data_dir=config["data_dir"], mask_dir=config["mask_dir"], transform=transform)
-train_loader = DataLoader(train_dataset, batch_size=config["batch_size"], shuffle=True)
+# モデルの初期化
+model = MyDetectionModel(input_nc=3, output_nc=1, num_classes=5).to(device)
 
 # 損失関数と最適化手法
-criterion = nn.MSELoss()
+criterion_bbox = nn.MSELoss()            # バウンディングボックス回帰用損失関数
+criterion_class = nn.CrossEntropyLoss()  # クラス分類用損失関数
 optimizer = optim.Adam(model.parameters(), lr=config["learning_rate"])
 
-# トレーニングループ
-losses = []
-for epoch in range(config["num_epochs"]):
+# 各クラスごとにトレーニング
+classes = ["human", "cello", "piano", "guitar", "saxophone"]
+for class_name in classes:
+    print(f"\nTraining for class: {class_name}")
+
+    # クラスごとのデータセットとデータローダーの設定
+    annotation_file = f"data/train/annotations_{class_name}.csv"
+    train_dataset = CustomDetectionDataset(
+        dataset_type=config["dataset_type"],
+        annotation_files=[annotation_file],
+        data_dir=config["data_dir"]
+    )
+    train_loader = DataLoader(train_dataset, batch_size=config["batch_size"], shuffle=True)
+
+    # クラス別トレーニングループ
+    for epoch in range(config["num_epochs"]):
+        model.train()
+        running_loss = 0.0
+        start_time = time.time()
+        
+        # tqdmを使用して進行状況バーを表示
+        with tqdm(total=len(train_loader), desc=f"Epoch {epoch+1}/{config['num_epochs']}") as pbar:
+            for batch_idx, (images, masks, bboxes, class_labels) in enumerate(train_loader):
+                images = images.to(device).float()
+                masks = masks.to(device).float()
+                bboxes = bboxes.to(device).float()
+                class_labels = class_labels.to(device).long()
+
+                optimizer.zero_grad()
+
+                # モデルの予測出力
+                bbox_preds, class_preds = model(images)
+
+                # 損失の計算
+                loss_bbox = criterion_bbox(bbox_preds, bboxes)
+                
+                # クラス予測とラベルをリシェイプ
+                batch_size, num_classes, height, width = class_preds.size()
+                class_preds = class_preds.permute(0, 2, 3, 1).reshape(-1, num_classes)  # [batch_size * height * width, num_classes]
+                class_labels = class_labels.expand(batch_size, height, width).reshape(-1)  # [batch_size * height * width]
+                loss_class = criterion_class(class_preds, class_labels)
+
+                # 逆伝播と最適化
+                loss = (loss_bbox + loss_class).float()
+                loss.backward()
+                optimizer.step()
+
+                running_loss += loss.item()
+                
+                # tqdmバーを更新し、残り時間を表示
+                pbar.set_postfix(loss=running_loss / (batch_idx + 1), eta=int((time.time() - start_time) * (len(train_loader) - batch_idx - 1) / (batch_idx + 1)))
+                pbar.update(1)
+
+        avg_loss = running_loss / len(train_loader)
+        print(f"\nClass: {class_name}, Epoch [{epoch+1}/{config['num_epochs']}], Loss: {avg_loss:.4f}")
+
+    # 各クラスのトレーニング完了後、モデルを保存
+    model_save_path = os.path.join(config["save_dir"], f"model_{class_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pth")
+    torch.save(model.state_dict(), model_save_path)
+    print(f"モデルが保存されました for class {class_name}: {model_save_path}")
+
+# 全クラスデータで最終エポックを実行（最終調整）
+print("\nFinal Epoch: Training on a subset of all classes combined")
+annotation_files = [f"data/train/annotations_{class_name}.csv" for class_name in classes]
+final_train_dataset = CustomDetectionDataset(
+    dataset_type=config["dataset_type"],
+    annotation_files=annotation_files,
+    data_dir=config["data_dir"]
+)
+
+# データサンプル数の制限（例えばクラスごとに100サンプルのみ使用）
+num_samples_per_class = 100  # 各クラスのサンプル数を指定
+
+# ランダムにサブセットを作成（全クラスから指定したサンプル数を抽出）
+all_indices = np.arange(len(final_train_dataset))
+np.random.shuffle(all_indices)
+selected_indices = all_indices[:num_samples_per_class * len(classes)]
+
+# サブセットデータローダーの作成
+final_train_subset = Subset(final_train_dataset, selected_indices)
+final_train_loader = DataLoader(final_train_subset, batch_size=config["batch_size"], shuffle=True)
+
+# 最終エポックのトレーニングループ
+for epoch in range(1):  # 最終エポック1回
     model.train()
     running_loss = 0.0
-    for i, (images, masks) in enumerate(train_loader):
-        images = images.to(device)
-        masks = masks.to(device)
-        
-        # 順伝播
-        outputs = model(images)
-        loss = criterion(outputs, masks)
+    start_time = time.time()
+    
+    # tqdmを使用して進行状況バーを表示
+    with tqdm(total=len(final_train_loader), desc="Final Epoch") as pbar:
+        for batch_idx, (images, masks, bboxes, class_labels) in enumerate(final_train_loader):
+            images = images.to(device).float()
+            masks = masks.to(device).float()
+            bboxes = bboxes.to(device).float()
+            class_labels = class_labels.to(device).long()
 
-        # 逆伝播と最適化
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+            optimizer.zero_grad()
 
-        running_loss += loss.item()
+            # モデルの予測出力
+            bbox_preds, class_preds = model(images)
 
-    # 平均損失の計算
-    avg_loss = running_loss / len(train_loader)
-    losses.append(avg_loss)
-    print(f"エポック {epoch + 1} が完了しました。平均損失: {avg_loss}")
+            # 損失の計算
+            loss_bbox = criterion_bbox(bbox_preds, bboxes)
+            
+            # クラス予測とラベルをリシェイプ
+            batch_size, num_classes, height, width = class_preds.size()
+            class_preds = class_preds.permute(0, 2, 3, 1).reshape(-1, num_classes)  # [batch_size * height * width, num_classes]
+            class_labels = class_labels.expand(batch_size, height, width).reshape(-1)  # [batch_size * height * width]
+            loss_class = criterion_class(class_preds, class_labels)
 
-# モデルの保存
-if not os.path.exists(config["save_dir"]):
-    os.makedirs(config["save_dir"])
+            # 逆伝播と最適化
+            loss = (loss_bbox + loss_class).float()
+            loss.backward()
+            optimizer.step()
 
-timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-model_save_path = os.path.join(config["save_dir"], f"fine_tuned_model_{timestamp}.pth")
-torch.save(model.state_dict(), model_save_path)
-print(f"トレーニング済みモデルが保存されました: {model_save_path}")
+            running_loss += loss.item()
+            
+            # tqdmバーを更新し、残り時間を表示
+            pbar.set_postfix(loss=running_loss / (batch_idx + 1), eta=int((time.time() - start_time) * (len(final_train_loader) - batch_idx - 1) / (batch_idx + 1)))
+            pbar.update(1)
 
-# 損失関数の可視化
-plt.figure()
-plt.plot(range(1, config["num_epochs"] + 1), losses, marker='o')
-plt.title("Training Loss")
-plt.xlabel("Epoch")
-plt.ylabel("Loss")
-loss_plot_path = os.path.join(config["save_dir"], f"training_loss_{timestamp}.png")
-plt.savefig(loss_plot_path)
-plt.close()
-print(f"損失関数のグラフが保存されました: {loss_plot_path}")
+    avg_loss = running_loss / len(final_train_loader)
+    print(f"\nFinal Epoch, Combined Classes (subset), Loss: {avg_loss:.4f}")
 
-# 予測結果の可視化
-model.eval()
-sample_images, sample_masks = next(iter(train_loader))
-sample_images = sample_images.to(device)
-sample_masks = sample_masks.to(device)
-with torch.no_grad():
-    outputs = model(sample_images)
-
-# 結果をプロット
-fig, axes = plt.subplots(3, config["batch_size"], figsize=(12, 6))
-for i in range(config["batch_size"]):
-    axes[0, i].imshow(sample_images[i].cpu().permute(1, 2, 0))  # 入力画像
-    axes[1, i].imshow(sample_masks[i].cpu().squeeze(), cmap='gray')  # 実際のマスク
-    # 予測されたマスクを表示
-    axes[2, i].imshow(outputs[i].cpu().squeeze()[0], cmap='gray')  # 予測されたマスクの1チャンネルを表示
-
-
-for ax in axes.flat:
-    ax.axis('off')
-
-output_plot_path = os.path.join(config["save_dir"], f"output_comparison_{timestamp}.png")
-plt.savefig(output_plot_path)
-plt.close()
-print(f"予測結果の比較グラフが保存されました: {output_plot_path}")
+# 最終エポック後に最終モデルを保存
+final_model_save_path = os.path.join(config["save_dir"], f"final_model_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pth")
+torch.save(model.state_dict(), final_model_save_path)
+print(f"最終モデルが保存されました: {final_model_save_path}")
