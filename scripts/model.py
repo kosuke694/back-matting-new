@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 class LightSelfAttention(nn.Module):
     def __init__(self, in_dim, head_count=2, reduction=4):
