@@ -1,102 +1,117 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
+
+class LightSelfAttention(nn.Module):
+    def __init__(self, in_dim, head_count=2, reduction=4):
+        super(LightSelfAttention, self).__init__()
+        self.head_count = head_count
+        self.query_conv = nn.Conv2d(in_dim, in_dim // reduction, 1)
+        self.key_conv = nn.Conv2d(in_dim, in_dim // reduction, 1)
+        self.value_conv = nn.Conv2d(in_dim, in_dim, 1)
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, x):
+        batch_size, channels, width, height = x.size()
+        x_down = F.interpolate(x, scale_factor=0.5, mode="bilinear", align_corners=True)
+        proj_query = self.query_conv(x_down).view(batch_size, -1, width * height // 4).permute(0, 2, 1)
+        proj_key = self.key_conv(x_down).view(batch_size, -1, width * height // 4)
+        energy = torch.bmm(proj_query, proj_key) / (channels ** 0.5)
+        attention = self.softmax(energy)
+        proj_value = self.value_conv(x_down).view(batch_size, -1, width * height // 4)
+        out = torch.bmm(proj_value, attention.permute(0, 2, 1))
+        out = out.view(batch_size, channels, width // 2, height // 2)
+        out = F.interpolate(out, size=(width, height), mode="bilinear", align_corners=True)
+        return out + x
+
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, use_attention=False):
+        super(ResidualBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.attention = LightSelfAttention(out_channels) if use_attention else None
+
+    def forward(self, x):
+        residual = x
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.conv2(x)
+        x = self.bn2(x)
+        if self.attention:
+            x = self.attention(x)
+        x += residual
+        return self.relu(x)
 
 class ResnetConditionHR(nn.Module):
-    def __init__(self, input_nc, output_nc, ngf=64, nf_part=64, norm_layer=nn.BatchNorm2d, use_dropout=False, n_blocks1=7, n_blocks2=3, padding_type='reflect', use_attention=True):
+    def __init__(self, input_nc, output_nc, ngf=64, nf_part=64, use_attention=False):
         super(ResnetConditionHR, self).__init__()
-        self.use_attention = use_attention
-        self.input_nc = input_nc
-        self.output_nc = output_nc
-        self.ngf = ngf
-        use_bias = True
 
-        # Encoder for main input
-        model_enc1 = [nn.ReflectionPad2d(3), nn.Conv2d(input_nc[0], ngf, kernel_size=7, padding=0, bias=use_bias),
-                      norm_layer(ngf), nn.ReLU(True)]
-        model_enc1 += [nn.Conv2d(ngf, ngf * 2, kernel_size=3, stride=2, padding=1, bias=use_bias),
-                       norm_layer(ngf * 2), nn.ReLU(True)]
-        model_enc2 = [nn.Conv2d(ngf * 2, ngf * 4, kernel_size=3, stride=2, padding=1, bias=use_bias),
-                      norm_layer(ngf * 4), nn.ReLU(True)]
+        # Encoder Blocks with residual connections
+        self.model_enc1 = nn.Sequential(
+            ResidualBlock(input_nc[0], ngf, use_attention),
+            ResidualBlock(ngf, ngf * 2, use_attention)
+        )
+        self.model_enc_back = nn.Sequential(
+            ResidualBlock(input_nc[1], ngf, use_attention),
+            ResidualBlock(ngf, ngf * 2, use_attention)
+        )
+        # `model_enc_seg` now accepts 3-channel input as specified in `input_nc[2]`
+        self.model_enc_seg = nn.Sequential(
+            ResidualBlock(input_nc[2], ngf, use_attention),  # Set input_nc[2] to 3
+            ResidualBlock(ngf, ngf * 2, use_attention)
+        )
+        self.model_enc_multi = nn.Sequential(
+            ResidualBlock(input_nc[3], ngf, use_attention),
+            ResidualBlock(ngf, ngf * 2, use_attention)
+        )
 
-        # Encoder for background
-        model_enc_back = [nn.ReflectionPad2d(3), nn.Conv2d(input_nc[1], ngf, kernel_size=7, padding=0, bias=use_bias),
-                          norm_layer(ngf), nn.ReLU(True)]
-        for i in range(2):
-            mult = 2**i
-            model_enc_back += [nn.Conv2d(ngf * mult, ngf * mult * 2, kernel_size=3, stride=2, padding=1, bias=use_bias),
-                               norm_layer(ngf * mult * 2), nn.ReLU(True)]
+        self.comb_back = nn.Conv2d(ngf * 2 * 2, nf_part, kernel_size=1)
+        self.comb_seg = nn.Conv2d(ngf * 2 * 2, nf_part, kernel_size=1)
+        self.comb_multi = nn.Conv2d(ngf * 2 * 2, nf_part, kernel_size=1)
 
-        # Encoder for segmentation
-        model_enc_seg = [nn.ReflectionPad2d(3), nn.Conv2d(input_nc[2], ngf, kernel_size=7, padding=0, bias=use_bias),
-                         norm_layer(ngf), nn.ReLU(True)]
-        for i in range(2):
-            mult = 2**i
-            model_enc_seg += [nn.Conv2d(ngf * mult, ngf * mult * 2, kernel_size=3, stride=2, padding=1, bias=use_bias),
-                              norm_layer(ngf * mult * 2), nn.ReLU(True)]
+        # Decoder components
+        self.model_res_dec = nn.Sequential(
+            nn.Conv2d(ngf * 2 + 3 * nf_part, ngf * 2, kernel_size=1),
+            nn.BatchNorm2d(ngf * 2),
+            nn.ReLU(True)
+        )
 
-        # Encoder for motion (multi-frame)
-        model_enc_multi = [nn.ReflectionPad2d(3), nn.Conv2d(input_nc[3], ngf, kernel_size=7, padding=0, bias=use_bias),
-                           norm_layer(ngf), nn.ReLU(True)]
-        for i in range(2):
-            mult = 2**i
-            model_enc_multi += [nn.Conv2d(ngf * mult, ngf * mult * 2, kernel_size=3, stride=2, padding=1, bias=use_bias),
-                                norm_layer(ngf * mult * 2), nn.ReLU(True)]
-
-        # Combine encoders
-        self.model_enc1 = nn.Sequential(*model_enc1)
-        self.model_enc2 = nn.Sequential(*model_enc2)
-        self.model_enc_back = nn.Sequential(*model_enc_back)
-        self.model_enc_seg = nn.Sequential(*model_enc_seg)
-        self.model_enc_multi = nn.Sequential(*model_enc_multi)
-
-        # Combining features from different encoders
-        mult = 2**2  # downsampled twice
-        self.comb_back = nn.Sequential(nn.Conv2d(ngf * mult * 2, nf_part, kernel_size=1, bias=False),
-                                       norm_layer(nf_part), nn.ReLU(True))
-        self.comb_seg = nn.Sequential(nn.Conv2d(ngf * mult * 2, nf_part, kernel_size=1, bias=False),
-                                      norm_layer(nf_part), nn.ReLU(True))
-        self.comb_multi = nn.Sequential(nn.Conv2d(ngf * mult * 2, nf_part, kernel_size=1, bias=False),
-                                        norm_layer(nf_part), nn.ReLU(True))
-
-        # Decoder
-        self.model_res_dec = self.build_resnet_block(ngf * mult + 3 * nf_part, n_blocks1, padding_type, norm_layer, use_dropout, use_bias)
-        self.model_res_dec_al = self.build_resnet_block(ngf * mult, n_blocks2, padding_type, norm_layer, use_dropout, use_bias)
-        self.model_res_dec_fg = self.build_resnet_block(ngf * mult, n_blocks2, padding_type, norm_layer, use_dropout, use_bias)
-
-        # Decoder output layers
-        self.model_al_out = self.build_output_layer(ngf, 1)
-        self.model_fg_out = self.build_output_layer(ngf, output_nc - 1)
-
-    def build_resnet_block(self, in_dim, n_blocks, padding_type, norm_layer, use_dropout, use_bias):
-        layers = [nn.Conv2d(in_dim, in_dim, kernel_size=1, bias=False), norm_layer(in_dim), nn.ReLU(True)]
-        for _ in range(n_blocks):
-            layers += [ResnetBlock(in_dim, padding_type, norm_layer, use_dropout, use_bias)]
-        return nn.Sequential(*layers)
-
-    def build_output_layer(self, in_dim, out_dim):
-        layers = [nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
-                  nn.Conv2d(in_dim * 4, int(in_dim * 2), kernel_size=3, padding=1),
-                  nn.Conv2d(int(in_dim * 2), out_dim, kernel_size=7, padding=0),
-                  nn.Tanh()]
-        return nn.Sequential(*layers)
+        # Output heads for alpha and foreground
+        self.model_al_out = nn.Sequential(
+            nn.Conv2d(ngf, 1, kernel_size=1),
+            nn.Tanh()
+        )
+        self.model_fg_out = nn.Sequential(
+            nn.Conv2d(ngf, output_nc - 1, kernel_size=1),
+            nn.Tanh()
+        )
 
     def forward(self, image, back, seg, multi):
-        img_feat1 = self.model_enc1(image)
-        img_feat = self.model_enc2(img_feat1)
+        img_feat = self.model_enc1(image)
         back_feat = self.model_enc_back(back)
-        seg_feat = self.model_enc_seg(seg)
+        seg_feat = self.model_enc_seg(seg)  # `seg` can now be 3 channels
         multi_feat = self.model_enc_multi(multi)
 
-        oth_feat = torch.cat([self.comb_back(torch.cat([img_feat, back_feat], dim=1)),
-                              self.comb_seg(torch.cat([img_feat, seg_feat], dim=1)),
-                              self.comb_multi(torch.cat([img_feat, back_feat], dim=1))], dim=1)
+        combined_feat = torch.cat([img_feat, back_feat], dim=1)
+        back_comb = self.comb_back(combined_feat)
 
-        out_dec = self.model_res_dec(torch.cat([img_feat, oth_feat], dim=1))
-        out_dec_al = self.model_res_dec_al(out_dec)
-        al_out = self.model_al_out(out_dec_al)
-        out_dec_fg = self.model_res_dec_fg(out_dec)
-        fg_out = self.model_fg_out(out_dec_fg)
+        combined_feat = torch.cat([img_feat, seg_feat], dim=1)
+        seg_comb = self.comb_seg(combined_feat)
+
+        combined_feat = torch.cat([img_feat, multi_feat], dim=1)
+        multi_comb = self.comb_multi(combined_feat)
+
+        decoder_input = torch.cat([img_feat, back_comb, seg_comb, multi_comb], dim=1)
+        out_dec = self.model_res_dec(decoder_input)
+
+        al_out = self.model_al_out(out_dec)
+        fg_out = self.model_fg_out(out_dec)
 
         return al_out, fg_out
+
+# モデルエイリアスとして指定
+MyDetectionModel = ResnetConditionHR

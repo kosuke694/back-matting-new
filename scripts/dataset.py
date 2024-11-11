@@ -47,7 +47,7 @@ class CustomDetectionDataset(Dataset):
 
         # 画像とマスクを読み込む
         image = Image.open(img_path).convert("RGB")
-        mask = Image.open(mask_path).convert("L")
+        mask = Image.open(mask_path).convert("L")  # マスクはグレースケールで読み込む
 
         # リサイズとテンソル変換
         image = self.resize(image)
@@ -58,7 +58,9 @@ class CustomDetectionDataset(Dataset):
         else:
             image = self.to_tensor(image)
         
+        # グレースケールのマスクを3チャンネルに変換
         mask = self.to_tensor(mask)
+        mask = mask.expand(3, -1, -1)  # 1チャンネルから3チャンネルに変換
 
         # バウンディングボックスと数値化したクラスラベル
         bbox = torch.tensor([
@@ -69,4 +71,5 @@ class CustomDetectionDataset(Dataset):
         # クラス名を数値ラベルに変換
         class_label = torch.tensor([self.label_mapping[label]])
 
-        return image, mask, bbox, class_label
+        # モデルの入力に合わせてimage, mask, mask, mask, bbox, class_labelを返す
+        return image, mask, mask, mask, bbox, class_label
