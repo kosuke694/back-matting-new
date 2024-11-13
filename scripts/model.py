@@ -25,93 +25,74 @@ class LightSelfAttention(nn.Module):
         return out + x
 
 class ResidualBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, use_attention=False):
+    def __init__(self, in_channels, out_channels, stride=1):
         super(ResidualBlock, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1)
         self.bn1 = nn.BatchNorm2d(out_channels)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
         self.bn2 = nn.BatchNorm2d(out_channels)
-        self.attention = LightSelfAttention(out_channels) if use_attention else None
+        if in_channels != out_channels:
+            self.conv1x1 = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride)
+        else:
+            self.conv1x1 = None
 
     def forward(self, x):
         residual = x
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
-        x = self.conv2(x)
-        x = self.bn2(x)
-        if self.attention:
-            x = self.attention(x)
-        x += residual
-        return self.relu(x)
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        if self.conv1x1:
+            residual = self.conv1x1(residual)
+        out += residual
+        return F.relu(out)
 
-class ResnetConditionHR(nn.Module):
-    def __init__(self, input_nc, output_nc, ngf=64, nf_part=64, use_attention=False):
-        super(ResnetConditionHR, self).__init__()
+class MyDetectionModel(nn.Module):
+    def __init__(self, input_nc, output_nc, num_classes=5):
+        super(MyDetectionModel, self).__init__()
+        # Self-Attentionレイヤーを定義
+        self.attention1 = LightSelfAttention(64)
+        self.attention2 = LightSelfAttention(128)
 
-        # Encoder Blocks with residual connections
+        # エンコーダ
         self.model_enc1 = nn.Sequential(
-            ResidualBlock(input_nc[0], ngf, use_attention),
-            ResidualBlock(ngf, ngf * 2, use_attention)
+            ResidualBlock(input_nc[0], 64),
+            nn.MaxPool2d(2),
+            self.attention1  # LightSelfAttentionを追加
         )
-        self.model_enc_back = nn.Sequential(
-            ResidualBlock(input_nc[1], ngf, use_attention),
-            ResidualBlock(ngf, ngf * 2, use_attention)
+        self.model_enc2 = nn.Sequential(
+            ResidualBlock(64, 128),
+            nn.MaxPool2d(2),
+            self.attention2  # LightSelfAttentionを追加
         )
-        # `model_enc_seg` now accepts 3-channel input as specified in `input_nc[2]`
-        self.model_enc_seg = nn.Sequential(
-            ResidualBlock(input_nc[2], ngf, use_attention),  # Set input_nc[2] to 3
-            ResidualBlock(ngf, ngf * 2, use_attention)
+        self.model_enc3 = nn.Sequential(
+            ResidualBlock(128, 256),
+            nn.MaxPool2d(2)
         )
-        self.model_enc_multi = nn.Sequential(
-            ResidualBlock(input_nc[3], ngf, use_attention),
-            ResidualBlock(ngf, ngf * 2, use_attention)
-        )
-
-        self.comb_back = nn.Conv2d(ngf * 2 * 2, nf_part, kernel_size=1)
-        self.comb_seg = nn.Conv2d(ngf * 2 * 2, nf_part, kernel_size=1)
-        self.comb_multi = nn.Conv2d(ngf * 2 * 2, nf_part, kernel_size=1)
-
-        # Decoder components
-        self.model_res_dec = nn.Sequential(
-            nn.Conv2d(ngf * 2 + 3 * nf_part, ngf * 2, kernel_size=1),
-            nn.BatchNorm2d(ngf * 2),
-            nn.ReLU(True)
+        self.model_enc4 = nn.Sequential(
+            ResidualBlock(256, 512),
+            nn.MaxPool2d(2)
         )
 
-        # Output heads for alpha and foreground
-        self.model_al_out = nn.Sequential(
-            nn.Conv2d(ngf, 1, kernel_size=1),
-            nn.Tanh()
-        )
-        self.model_fg_out = nn.Sequential(
-            nn.Conv2d(ngf, output_nc - 1, kernel_size=1),
-            nn.Tanh()
-        )
+        # デコーダ
+        self.model_dec1 = nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)
+        self.model_dec2 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
+        self.model_dec3 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+        self.bbox_output = nn.Conv2d(64, output_nc, kernel_size=1)
+        self.class_output = nn.Conv2d(64, num_classes, kernel_size=1)  # num_classesはクラス数
 
     def forward(self, image, back, seg, multi):
+        # エンコーダ
         img_feat = self.model_enc1(image)
-        back_feat = self.model_enc_back(back)
-        seg_feat = self.model_enc_seg(seg)  # `seg` can now be 3 channels
-        multi_feat = self.model_enc_multi(multi)
+        img_feat = self.model_enc2(img_feat)
+        img_feat = self.model_enc3(img_feat)
+        img_feat = self.model_enc4(img_feat)
 
-        combined_feat = torch.cat([img_feat, back_feat], dim=1)
-        back_comb = self.comb_back(combined_feat)
+        # デコーダ
+        x = self.model_dec1(img_feat)
+        x = self.model_dec2(x)
+        x = self.model_dec3(x)
 
-        combined_feat = torch.cat([img_feat, seg_feat], dim=1)
-        seg_comb = self.comb_seg(combined_feat)
+        # bbox_preds と class_preds の出力
+        bbox_preds = self.bbox_output(x)
+        class_preds = self.class_output(x)
 
-        combined_feat = torch.cat([img_feat, multi_feat], dim=1)
-        multi_comb = self.comb_multi(combined_feat)
-
-        decoder_input = torch.cat([img_feat, back_comb, seg_comb, multi_comb], dim=1)
-        out_dec = self.model_res_dec(decoder_input)
-
-        al_out = self.model_al_out(out_dec)
-        fg_out = self.model_fg_out(out_dec)
-
-        return al_out, fg_out
-
-# モデルエイリアスとして指定
-MyDetectionModel = ResnetConditionHR
+        return bbox_preds, class_preds
