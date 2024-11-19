@@ -4,12 +4,55 @@ import torchvision
 import cv2, pdb
 
 
-def composite4(fg, bg, a):
-	fg = np.array(fg, np.float32)
-	alpha= np.expand_dims(a / 255,axis=2)
-	im = alpha * fg + (1 - alpha) * bg
-	im = im.astype(np.uint8)
-	return im
+def composite4(fg, bg, alpha):
+    """
+    Composite the foreground (fg) over the background (bg) using alpha matte.
+    Shapes:
+    - fg: [H, W, 3]
+    - bg: [H, W, 3]
+    - alpha: [H, W, 1]
+    """
+    # Convert alpha to 3D if 2D
+    if len(alpha.shape) == 2:
+        alpha = np.expand_dims(alpha, axis=-1)  # Convert to [H, W, 1]
+    elif alpha.shape[-1] > 1:
+        alpha = alpha[..., :1]  # If more than one channel, keep only one
+
+    # Resize fg and alpha to match bg if necessary
+    if fg.shape[:2] != bg.shape[:2]:
+        fg = cv2.resize(fg, (bg.shape[1], bg.shape[0]))  # Resize fg
+    if alpha.shape[:2] != bg.shape[:2]:
+        alpha = cv2.resize(alpha, (bg.shape[1], bg.shape[0]))  # Resize alpha
+
+    # Ensure fg has 3 channels
+    if fg.shape[-1] > 3:
+        fg = fg[..., :3]  # Take only the first 3 channels
+
+    # Normalize alpha to [0, 1] range if needed
+    if alpha.max() > 1:
+        alpha = alpha / 255.0
+
+    try:
+        # Ensure alpha has correct shape
+        if len(alpha.shape) != 3 or alpha.shape[2] != 1:
+            raise ValueError(f"Alpha shape mismatch: {alpha.shape}, expected [H, W, 1]")
+
+        # Ensure fg and bg have correct shape
+        if len(fg.shape) != 3 or fg.shape[2] != 3:
+            raise ValueError(f"Foreground shape mismatch: {fg.shape}, expected [H, W, 3]")
+        if len(bg.shape) != 3 or bg.shape[2] != 3:
+            raise ValueError(f"Background shape mismatch: {bg.shape}, expected [H, W, 3]")
+
+        # Composite operation
+        im = alpha * fg + (1 - alpha) * bg
+        return im.astype(np.uint8)
+
+    except ValueError as e:
+        print(f"Error during composition: {e}")
+        print(f"Alpha shape: {alpha.shape}, FG shape: {fg.shape}, BG shape: {bg.shape}")
+        raise
+
+
 
 def compose_image_withshift(alpha_pred,fg_pred,bg,seg):
 
