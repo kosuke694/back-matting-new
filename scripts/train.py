@@ -10,6 +10,8 @@ from model import MyDetectionModel
 from datetime import datetime
 from tqdm import tqdm
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
+
 
 # 設定ファイルの読み込み
 with open("C:/Users/klab/Desktop/back-matting-new/configs/train_config.yaml", "r", encoding="utf-8") as file:
@@ -43,25 +45,38 @@ current_time = datetime.now().strftime('%Y%m%d_%H%M%S')
 cycle_dir = f"C:/Users/klab/Desktop/back-matting-new/fine_tuned/InstrumentModel/{current_time}_samples_{num_samples_per_class}"
 os.makedirs(cycle_dir, exist_ok=True)
 
+# 共通関数: データローダー作成
+def create_data_loader(annotation_file, dataset_type, num_samples=None):
+    dataset = CustomDetectionDataset(
+        data_dir=config["data_dir"],
+        dataset_type=dataset_type,
+        annotation_files=[annotation_file]
+    )
+
+    if len(dataset) == 0:
+        print(f"Warning: No data available for {dataset_type}. Skipping.")
+        return None
+
+    if num_samples:
+        indices = np.arange(len(dataset))
+        np.random.shuffle(indices)
+        subset_indices = indices[:num_samples]
+        dataset = Subset(dataset, subset_indices)
+
+    return DataLoader(dataset, batch_size=config["batch_size"], shuffle=(dataset_type == "train"))
+
 # 各クラスごとにトレーニングとバリデーション
 classes = ["human", "cello", "piano", "guitar", "saxophone"]
 for class_name in classes:
     print(f"Training for class: {class_name}")
 
-    # クラスごとのデータセットとデータローダーの設定
-    annotation_file = f"C:/Users/klab/Desktop/back-matting-new/data/train/train_annotation_{class_name}.csv"
-    train_dataset = CustomDetectionDataset(
-        data_dir=config["data_dir"],
-        dataset_type=config["dataset_type"]["train"],
-        annotation_files=[annotation_file]
-    )
+    # トレーニングデータローダー
+    train_annotation_file = f"C:/Users/klab/Desktop/back-matting-new/data/train/train_annotation_{class_name}.csv"
+    train_loader = create_data_loader(train_annotation_file, "train", num_samples_per_class)
 
-    # サンプル数制限を適用
-    indices = np.arange(len(train_dataset))
-    np.random.shuffle(indices)
-    selected_indices = indices[:num_samples_per_class]
-    train_subset = Subset(train_dataset, selected_indices)
-    train_loader = DataLoader(train_subset, batch_size=config["batch_size"], shuffle=True)
+    if train_loader is None:
+        print(f"Skipping training for class: {class_name} due to lack of training data.")
+        continue
 
     # クラス別トレーニングループ
     for epoch in range(config["num_epochs"]):
@@ -120,28 +135,18 @@ for class_name in classes:
     torch.save(model.state_dict(), model_save_path)
     print(f"モデルが保存されました for class {class_name}: {model_save_path}")
 
-    # 各クラスの学習終了ごとにバリデーション
+    # バリデーションデータローダー
     print(f"Validating for class: {class_name}")
     val_annotation_file = f"C:/Users/klab/Desktop/back-matting-new/data/validation/validation_annotation_{class_name}.csv"
-    validation_dataset = CustomDetectionDataset(
-        data_dir=config["data_dir"],
-        dataset_type=config["dataset_type"]["validation"],
-        annotation_files=[val_annotation_file]
-    )
+    val_loader = create_data_loader(val_annotation_file, "validation", num_validation_samples)
 
-    if len(validation_dataset) == 0:
-        print(f"Warning: No validation data available for class {class_name}. Skipping validation.")
+    if val_loader is None:
+        print(f"Skipping validation for class: {class_name}")
     else:
-        indices = np.arange(len(validation_dataset))
-        np.random.shuffle(indices)
-        selected_indices = indices[:num_validation_samples]
-        validation_subset = Subset(validation_dataset, selected_indices)
-        validation_loader = DataLoader(validation_subset, batch_size=config["batch_size"], shuffle=False)
-
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for batch in validation_loader:
+            for batch in val_loader:
                 if isinstance(batch, list) and len(batch) == 6:
                     images, masks, seg1, seg2, bbox, class_labels = batch
                 else:
@@ -164,39 +169,41 @@ for class_name in classes:
 
                 val_loss += loss.item()
 
-        avg_val_loss = val_loss / len(validation_loader)
+        avg_val_loss = val_loss / len(val_loader)
         print(f"Validation for class {class_name}, Average Loss: {avg_val_loss:.4f}")
 
-# テストデータで評価
+# テストデータローダーの設定
 print("Testing model on test data")
 test_annotation_file = f"C:/Users/klab/Desktop/back-matting-new/data/test/test_annotation_{class_name}.csv"
-test_dataset = CustomDetectionDataset(
-    data_dir=config["data_dir"],
-    dataset_type=config["dataset_type"]["test"],
-    annotation_files=[test_annotation_file]  # クラスごとのテストアノテーションファイル
-)
+test_loader = create_data_loader(test_annotation_file, "test", num_test_samples)
 
-# テストデータが存在するか確認
-if len(test_dataset) == 0:
-    print("Warning: No test data available. Skipping test evaluation.")
+# テスト結果保存ディレクトリの作成
+test_output_base_dir = "C:/Users/klab/Desktop/back-matting-new/fine_tuned/in"
+test_run_dir_name = f"{current_time}_train_{num_samples_per_class}"
+test_results_dir = os.path.join(test_output_base_dir, test_run_dir_name)
+os.makedirs(test_results_dir, exist_ok=True)
+
+print(f"Test results will be saved in: {test_results_dir}")
+
+# テストデータでの評価＆予測結果の保存
+if test_loader is None:
+    print("Skipping test evaluation due to lack of test data.")
 else:
-    indices = np.arange(len(test_dataset))
-    np.random.shuffle(indices)
-    selected_indices = indices[:num_test_samples]  # Testサンプル数制限
-    test_subset = Subset(test_dataset, selected_indices)
-    test_loader = DataLoader(test_subset, batch_size=config["batch_size"], shuffle=False)
-
     model.eval()
     test_loss = 0.0
+    predictions = []
+    saved_image_count = 0  # 保存した画像の枚数をカウント
+    max_images_to_save = 10  # 保存する画像の最大枚数
+
     with torch.no_grad():
-        for batch in test_loader:
+        for idx, batch in enumerate(test_loader):
             if isinstance(batch, list) and len(batch) == 6:
                 images, masks, seg1, seg2, bbox, class_labels = batch
             else:
                 raise ValueError(f"Unexpected data format in test_loader: {batch}")
 
             images = images.to(device, dtype=torch.float)
-            masks = masks.to(device, dtype=torch.float)
+            masks = masks[:, :1, :, :].to(device, dtype=torch.float)
             class_labels = class_labels.to(device)
 
             bbox_preds, class_preds = model(images, images, images, images)
@@ -206,18 +213,55 @@ else:
             class_preds = class_preds.permute(0, 2, 3, 1).reshape(-1, class_channels)
             class_labels = class_labels.view(-1).repeat(width * height).long()
 
-            # 損失の計算
             loss_bbox = criterion_bbox(bbox_preds, masks_resized)
             loss_class = criterion_class(class_preds, class_labels)
             loss = loss_bbox + loss_class
 
             test_loss += loss.item()
 
-    # テストデータの平均損失
+            # 保存用の結果を生成
+            for i in range(len(images)):
+                if saved_image_count >= max_images_to_save:
+                    break  # 保存する画像が上限に達した場合は終了
+
+                image_np = images[i].cpu().numpy().transpose(1, 2, 0)  # チャネルを移動
+                image_np = (image_np * 255).astype(np.uint8)  # 正規化を戻す
+
+                predicted_bbox = bbox_preds[i].cpu().numpy().flatten()
+                predicted_class = torch.argmax(class_preds[i]).item()
+
+                # 結果をリストに保存
+                predictions.append({
+                    "image_index": idx * batch_size + i,
+                    "predicted_class": predicted_class,
+                    "predicted_bbox": predicted_bbox.tolist()
+                })
+
+                # 画像に描画して保存
+                plt.figure(figsize=(6, 6))
+                plt.imshow(image_np)
+                plt.gca().add_patch(plt.Rectangle(
+                    (predicted_bbox[0], predicted_bbox[1]),
+                    predicted_bbox[2] - predicted_bbox[0],
+                    predicted_bbox[3] - predicted_bbox[1],
+                    edgecolor='red', linewidth=2, fill=False
+                ))
+                plt.title(f"Predicted Class: {list(label_mapping.keys())[predicted_class]}")
+                plt.axis('off')
+
+                # 画像を保存
+                result_image_path = os.path.join(test_results_dir, f"result_{idx}_{i}.png")
+                plt.savefig(result_image_path)
+                plt.close()
+
+                saved_image_count += 1  # 保存した画像の数をカウント
+
     avg_test_loss = test_loss / len(test_loader)
     print(f"Test data, Average Loss: {avg_test_loss:.4f}")
 
-# 最終モデルの保存
-final_model_save_path = os.path.join(cycle_dir, f"final_model_{current_time}.pth")
-torch.save(model.state_dict(), final_model_save_path)
-print(f"最終モデルが保存されました: {final_model_save_path}")
+    # 結果をCSVで保存
+    predictions_csv_path = os.path.join(test_results_dir, "predictions.csv")
+    import pandas as pd
+    pd.DataFrame(predictions).to_csv(predictions_csv_path, index=False)
+    print(f"Test predictions saved in {predictions_csv_path}")
+    print(f"Test result images saved in {test_results_dir}")
